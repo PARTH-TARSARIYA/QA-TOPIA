@@ -1,37 +1,21 @@
 import numpy as np
 import pandas as pd
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import json
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from groq import Groq
-import os
-import torch
-import torch.nn.functional as F
-import ast
 
-nltk.download('punkt_tab')
-nltk.download('stopwords')
+# ---------- GLOBALS ----------
+df = None
+embedding_model = None
+similarity_model = None
+prediction_model = None
+temperature = None
+id2label = None
 
-# ── Global variables ──
-stop_words = set(stopwords.words('english'))
-df = pd.read_csv('Data/final_TM_data.csv')
-
-# ── Fix embedding parsing ──
-def parse_embedding(embedding_str):
-    if isinstance(embedding_str, str):
-        cleaned = embedding_str.strip().strip('[]')
-        return np.array([float(x) for x in cleaned.split()], dtype=np.float32)
-    return np.array(embedding_str, dtype=np.float32)
-
-
-df['question_embedding'] = df['question_embedding'].apply(parse_embedding)
-df['answer_embedding']   = df['answer_embedding'].apply(parse_embedding)
-
-# ── Model definitions ──
+# ---------- MODELS ----------
 class ResBlock(nn.Module):
     def __init__(self, i, o, d):
         super().__init__()
@@ -68,97 +52,50 @@ class TempScaler(nn.Module):
     def forward(self, logits):
         return logits / self.T.clamp(min=0.5, max=3.0)
 
-# ── Load label maps ──
-with open('models/label_maps.json') as f:
-    id2label = json.load(f)["id2label"]
+# ---------- LOAD EVERYTHING ----------
+def load_all():
+    global df, embedding_model, similarity_model
+    global prediction_model, temperature, id2label
 
-# ── Load model ──
-prediction_model = TopicMLP()
-prediction_model.load_state_dict(
-    torch.load('models/best_model.pt', map_location='cpu')['state']
-)
-prediction_model.eval()
+    print("Loading data...")
 
-temperature = TempScaler()
-temperature.load_state_dict(
-    torch.load('models/temperature.pt', map_location='cpu')
-)
-temperature.eval()
+    df = pd.read_csv("Data/final_TM_data.csv")
 
-# ── Embedding model ──
-embedding_model = SentenceTransformer('sbert_ft')
-similarity_model = SentenceTransformer('all-mpnet-base-v2')
+    def parse_embedding(x):
+        if isinstance(x, str):
+            x = x.strip().strip('[]')
+            return np.array([float(i) for i in x.split()], dtype=np.float32)
+        return np.array(x, dtype=np.float32)
 
-# ── Preprocessing ──
-def text_preprocess(q, a):
-    text = str(q) + ' ' + str(a)
-    tokens = word_tokenize(text)
-    return [w for w in tokens if w.lower() not in stop_words]
+    df['question_embedding'] = df['question_embedding'].apply(parse_embedding)
+    df['answer_embedding'] = df['answer_embedding'].apply(parse_embedding)
 
-# ── Similarity search ──
-def get_similarity(question, answer, topic):
+    with open("models/label_maps.json") as f:
+        id2label = json.load(f)["id2label"]
 
-    embed_question = similarity_model.encode(
-        [question], normalize_embeddings=True
+    prediction_model = TopicMLP()
+    prediction_model.load_state_dict(
+        torch.load("models/best_model.pt", map_location="cpu")["state"]
     )
-    embed_answer = similarity_model.encode(
-        [answer], normalize_embeddings=True
+    prediction_model.eval()
+
+    temperature = TempScaler()
+    temperature.load_state_dict(
+        torch.load("models/temperature.pt", map_location="cpu")
     )
+    temperature.eval()
 
-    new_df = df[df['Generalized_topics'] == topic]
+    embedding_model = SentenceTransformer("sbert_ft")
+    similarity_model = SentenceTransformer("all-mpnet-base-v2")
 
-    # Convert embeddings to matrix
-    q_embs = np.stack(new_df['question_embedding'].values)
-    a_embs = np.stack(new_df['answer_embedding'].values)
+    print("All loaded!")
 
-    # Vectorized similarity
-    sim_q = cosine_similarity(embed_question, q_embs)[0]
-    sim_a = cosine_similarity(embed_answer, a_embs)[0]
-
-    # Get top indices
-    top_q_idx = np.argsort(sim_q)[::-1][1:11]
-    top_a_idx = np.argsort(sim_a)[::-1][1:11]
-
-    # ---------------- REMOVE DUPLICATES ----------------
-    seen_questions = set()
-    seen_answers = set()
-
-    que_list = []
-    for i in top_q_idx:
-        if sim_q[i] > 0.5:
-            q_text = new_df.iloc[i]['Question']
-
-            if q_text not in seen_questions:
-                que_list.append([
-                    round(float(sim_q[i] * 100), 4),
-                    q_text,
-                    new_df.iloc[i]['Topics']
-                ])
-                seen_questions.add(q_text)
-
-    ans_list = []
-    for i in top_a_idx:
-        if sim_a[i] > 0.5:
-            a_text = new_df.iloc[i]['Answer']
-
-            if a_text not in seen_answers:
-                ans_list.append([
-                    round(float(sim_a[i] * 100), 4),
-                    a_text,
-                    new_df.iloc[i]['Topics']
-                ])
-                seen_answers.add(a_text)
-
-    return que_list, ans_list
-
-# ── Main prediction ──
+# ---------- PREDICT ----------
 def predict_topic(question, answer):
-    text = ' '.join(text_preprocess(question, answer))
+    text = question + " " + answer
 
     embedding = embedding_model.encode(
-        [text],
-        convert_to_numpy=True,
-        normalize_embeddings=True
+        [text], normalize_embeddings=True
     ).astype(np.float32)
 
     x = torch.from_numpy(embedding)
@@ -171,5 +108,44 @@ def predict_topic(question, answer):
         confidence, pred = torch.max(probs, dim=1)
 
     topic = id2label[str(pred.item())]
-
     return topic, float(confidence.item())
+
+# ---------- SIMILARITY ----------
+def get_similarity(question, answer, topic):
+
+    embed_q = similarity_model.encode([question], normalize_embeddings=True)
+    embed_a = similarity_model.encode([answer], normalize_embeddings=True)
+
+    new_df = df[df['Generalized_topics'] == topic]
+
+    q_embs = np.stack(new_df['question_embedding'].values)
+    a_embs = np.stack(new_df['answer_embedding'].values)
+
+    sim_q = cosine_similarity(embed_q, q_embs)[0]
+    sim_a = cosine_similarity(embed_a, a_embs)[0]
+
+    top_q_idx = np.argsort(sim_q)[::-1][1:11]
+    top_a_idx = np.argsort(sim_a)[::-1][1:11]
+
+    que_list = []
+    ans_list = []
+
+    for i in top_q_idx:
+        if sim_q[i] > 0.5:
+            row = new_df.iloc[i]
+            que_list.append([
+                round(float(sim_q[i]*100), 4),
+                row["Question"],
+                row["Topics"]
+            ])
+
+    for i in top_a_idx:
+        if sim_a[i] > 0.5:
+            row = new_df.iloc[i]
+            ans_list.append([
+                round(float(sim_a[i]*100), 4),
+                row["Answer"],
+                row["Topics"]
+            ])
+
+    return que_list, ans_list
