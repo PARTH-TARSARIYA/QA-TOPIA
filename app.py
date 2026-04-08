@@ -1,5 +1,5 @@
 import streamlit as st
-from final_code import predict_topic, get_similarity
+import requests
 
 st.set_page_config(page_title="Topic Modeling QA System", layout="wide")
 
@@ -19,25 +19,30 @@ if st.button("Analyze"):
     if user_question.strip() == "" or user_answer.strip() == "":
         st.warning("Please enter both question and answer.")
     else:
-        topic, confidence = predict_topic(user_question, user_answer)
 
-        if confidence >= 0.7:
-            related_questions, related_answers = get_similarity(
-                user_question, user_answer, topic
-            )
-            use_similarity = True
-            
+        response = requests.post(
+            "http://localhost:8000/analyze",
+            json={
+                "question": user_question,
+                "answer": user_answer
+            }
+        )
+
+        data = response.json()
+
+        topic = data["topic"]
+        confidence = data["confidence"]
+        related_questions = data["questions"]
+        related_answers = data["answers"]
+
         if related_answers == [] or related_questions == [] or confidence < 0.7:
             use_similarity = False
             st.write("Enter related to research question and answer!")
-            
-
-        # ── Display Topic ──
         else:
+            use_similarity = True
             st.subheader('Related Topic')
             st.success(f"{topic}  \nConfidence : {round(confidence, 4)}")
 
-        # ── Answers ──
         if use_similarity:
             st.subheader("📚 Similar Answers")
 
@@ -49,7 +54,6 @@ if st.button("Analyze"):
                 """)
                 st.markdown("---")
 
-        # ── Sidebar Questions ──
         st.sidebar.title("🔍 Related Questions")
 
         if use_similarity:
